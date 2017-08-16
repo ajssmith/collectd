@@ -1,6 +1,6 @@
 /**
  * collectd - src/amqp1.c
- * Copyright(c) 2016 Red Hat Inc.
+ * Copyright(c) 2017 Red Hat Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -73,7 +73,10 @@ typedef struct amqp1_config_instance_t {
   char              *postfix;
   char              escape_char;
   _Bool             pre_settle;
+  char              send_to[128];
 } amqp1_config_instance_t;
+
+DEQ_DECLARE(amqp1_config_instance_t, amqp1_config_instance_list_t);
 
 typedef struct cd_message_t {
     DEQ_LINKS(struct cd_message_t);
@@ -83,45 +86,44 @@ typedef struct cd_message_t {
 
 DEQ_DECLARE(cd_message_t, cd_message_list_t);
 
-/* globals for now */
-pn_connection_t         *conn;
-pn_session_t            *ssn;
-pn_link_t               *sender;
-pn_proactor_t           *proactor = NULL;
-pthread_mutex_t         send_lock;
-cd_message_list_t       out_messages;
-uint64_t                cd_tag = 1;
-int                     exit_code = 0;
-uint64_t                sent = 0;
-uint64_t                acknowledged = 0;
-amqp1_config_t          *conf;
-amqp1_config_instance_t *instance;
-bool                    finished = false;
+/* 
+ * Global Variables
+ */
+pn_connection_t   *conn;
+pn_session_t      *ssn;
+pn_link_t         *sender;
+pn_proactor_t     *proactor = NULL;
+pthread_mutex_t   send_lock;
+cd_message_list_t out_messages;
+uint64_t          cd_tag = 1;
+int               exit_code = 0;
+uint64_t          acknowledged = 0;
+amqp1_config_t    *transport;
+bool              finished = false;
 
 /* The eventloop thread will run as long as event_loop is set to zero */
-static int event_loop = 0;
-static int event_thread_running = 0;
+static int       event_thread_running = 0;
 static pthread_t event_thread_id;
 
-DEQ_DECLARE(amqp1_config_t, amqp1_config_list_t);
-DEQ_DECLARE(amqp1_config_instance_t, amqp1_config_instance_list_t);
-
+/*
+ * Functions
+ */
 static void cd_message_free(cd_message_t *cdm)
 {
   if (cdm->mbuf.start) {
     free((void *)cdm->mbuf.start);
   }
   free(cdm);
-}
+} /* }}} void cd_message_free */
 
-static int amqp1_send_out_messages(pn_link_t *link)
+static int amqp1_send_out_messages(pn_link_t *link) /* {{{ */
 {
-  uint64_t                dtag;
-  cd_message_list_t       to_send;
-  cd_message_t            *cdm;
-  int                     link_credit = pn_link_credit(link);
-  int                     event_count = 0;
-  pn_delivery_t           *dlv;
+  uint64_t          dtag;
+  cd_message_list_t to_send;
+  cd_message_t      *cdm;
+  int               link_credit = pn_link_credit(link);
+  int               event_count = 0;
+  pn_delivery_t     *dlv;
 
   DEQ_INIT(to_send);
 
@@ -159,28 +161,28 @@ static int amqp1_send_out_messages(pn_link_t *link)
   }
 
   return event_count;
-}
+} /* }}} int amqp1_send_out_messages */
 
-static void check_condition(pn_event_t *e, pn_condition_t *cond) {
+static void check_condition(pn_event_t *e, pn_condition_t *cond) /* {{{ */
+{
   if (pn_condition_is_set(cond)) {
     exit_code = 1;
     /* TODO: log condition name and description */
   }
-}
+} /* }}} void check_condition */
 
-static void handle(pn_event_t *event)
+static void handle(pn_event_t *event) /* {{{ */
 {
 
   switch (pn_event_type(event)) {
 
   case PN_CONNECTION_INIT:{
     conn = pn_event_connection(event);
-    /* TODO: set container id? */
+    pn_connection_set_container(conn, transport->address);
     pn_connection_open(conn);
     ssn = pn_session(conn);
     pn_session_open(ssn);
     sender = pn_sender(ssn, "cd-sender");
-    /* TODO: per instance config */
     pn_link_set_snd_settle_mode(sender, PN_SND_MIXED);
     pn_link_open(sender);
     break;
@@ -238,11 +240,10 @@ static void handle(pn_event_t *event)
 
     default: break;
   }
-}
+} /* }}} void handle */
 
 static void *event_thread(void __attribute__((unused)) * arg) /* {{{ */
 {
-  /* TODO: while or for to handle events? */
   do {
     pn_event_batch_t *events = pn_proactor_wait(proactor);
     pn_event_t *e;
@@ -253,21 +254,21 @@ static void *event_thread(void __attribute__((unused)) * arg) /* {{{ */
   } while (!finished);
 
   return NULL;
-}
+} /* }}} void event_thread */
 
 static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
                        user_data_t *user_data) 
 {
   amqp1_config_instance_t *instance = user_data->data;
-  int  status = 0;
-  size_t bfree = BUFSIZE;
-  size_t bfill = 0;
+  int          status = 0;
+  size_t       bfree = BUFSIZE;
+  size_t       bfill = 0;
   cd_message_t *cdm;
-  size_t bufsize = BUFSIZE;
-  pn_data_t *body;
+  size_t       bufsize = BUFSIZE;
+  pn_data_t    *body;
   pn_message_t *message;
  
-  if ((ds == NULL) || (vl == NULL) || (conf == NULL))
+  if ((ds == NULL) || (vl == NULL) || (transport == NULL))
     return EINVAL;
 
   cdm = NEW(cd_message_t);
@@ -309,7 +310,7 @@ static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
   /* encode message */
   message = pn_message();
   /* todo: proper address generation concat conf->address, instance->name */
-  pn_message_set_address(message, instance->name);
+  pn_message_set_address(message, instance->send_to);
   body = pn_message_body(message);
   pn_data_clear(body);
   pn_data_put_binary(body, cdm->mbuf);
@@ -333,18 +334,18 @@ static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
 
 static void amqp1_config_transport_free(void *ptr) /* {{{ */
 {
-  amqp1_config_t *conf = ptr;
+  amqp1_config_t *transport = ptr;
  
-  if (conf == NULL)
+  if (transport == NULL)
     return;
 
-  sfree(conf->name);
-  sfree(conf->host);
-  sfree(conf->user);
-  sfree(conf->password);
-  sfree(conf->address);
+  sfree(transport->name);
+  sfree(transport->host);
+  sfree(transport->user);
+  sfree(transport->password);
+  sfree(transport->address);
 
-  sfree(conf);
+  sfree(transport);
 } /* }}} void amqp1_config_transport_free */
 
 static void amqp1_config_instance_free(void *ptr) /* {{{ */
@@ -365,6 +366,7 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
 {
   int  status=0;
   char *key = NULL;
+  amqp1_config_instance_t *instance;
 
   /* TODO: fix conf and instance references */
   instance = calloc(1, sizeof(*instance));
@@ -438,37 +440,39 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
   }
 
   if (status != 0) {
-    amqp1_config_instance_free(conf);
+    amqp1_config_instance_free(instance);
     return status;
   } else {
     char tpname[128];
     snprintf(tpname, sizeof(tpname), "amqp1/%s", instance->name);
+    snprintf(instance->send_to, sizeof(instance->send_to), "u/%s/%s",
+             transport->address, instance->name);
     /* TODO: should this move to after thread is created in init? */
     status = plugin_register_write(tpname, amqp1_write, &(user_data_t) {
             .data = instance, .free_func = amqp1_config_instance_free, });
     if (status != 0) {
       amqp1_config_instance_free(instance);
-    }  
+    }
   }
   return status;
 } /* }}} int amqp1_config_instance */
   
 static int amqp1_config_transport(oconfig_item_t *ci) /* {{{ */
 {
-  int  status=0;
+  int status=0;
   
-  conf = calloc(1, sizeof(*conf));
-  if (conf == NULL) {
+  transport = calloc(1, sizeof(*transport));
+  if (transport == NULL) {
     ERROR("amqp1 plugin: calloc failed.");
     return ENOMEM;
   }
 
   /* Initialize transport configuration {{{ */
-  conf->name = NULL;
+  transport->name = NULL;
 
-  status = cf_util_get_string(ci, &conf->name);
+  status = cf_util_get_string(ci, &transport->name);
   if (status != 0) {
-    sfree(conf);
+    sfree(transport);
     return status;
   }
  
@@ -476,15 +480,15 @@ static int amqp1_config_transport(oconfig_item_t *ci) /* {{{ */
     oconfig_item_t *child = ci->children + i;
 
     if (strcasecmp("Host", child->key) == 0)
-      status = cf_util_get_string(child, &conf->host);
+      status = cf_util_get_string(child, &transport->host);
     else if (strcasecmp("Port", child->key) == 0)
-      status = cf_util_get_string(child, &conf->port);
+      status = cf_util_get_string(child, &transport->port);
     else if (strcasecmp("User", child->key) == 0)
-      status = cf_util_get_string(child, &conf->user);
+      status = cf_util_get_string(child, &transport->user);
     else if (strcasecmp("Password", child->key) == 0)
-      status = cf_util_get_string(child, &conf->password);
+      status = cf_util_get_string(child, &transport->password);
     else if (strcasecmp("Address", child->key) == 0)
-      status = cf_util_get_string(child, &conf->address);
+      status = cf_util_get_string(child, &transport->address);
     else if (strcasecmp("Instance",child->key) == 0)
       amqp1_config_instance(child);
     else
@@ -497,7 +501,7 @@ static int amqp1_config_transport(oconfig_item_t *ci) /* {{{ */
   }
 
   if (status != 0) {
-    amqp1_config_transport_free(conf);
+    amqp1_config_transport_free(transport);
   }
   return status;
 }  /* }}} int amqp1_config_transport */
@@ -526,7 +530,7 @@ static int amqp1_init(void) /* {{{ */
   if (proactor == NULL) {
     pthread_mutex_init(&send_lock, /* attr = */ NULL);
     proactor = pn_proactor();
-    pn_proactor_addr(addr, sizeof(addr),conf->host,conf->port);
+    pn_proactor_addr(addr, sizeof(addr),transport->host,transport->port);
     pn_proactor_connect(proactor, conn, addr);
     /* start_thread */
     status = plugin_thread_create(&event_thread_id, NULL /* no attributes */,
@@ -544,19 +548,41 @@ static int amqp1_init(void) /* {{{ */
 
 static int amqp1_shutdown(void) /* {{{ */
 {
-  event_loop = 1;
-    /*
-Shutdown the event thread
-Close the connection
-Free any buffers on the out_messages list
-Free the configuration
-     */
+  cd_message_t *cdm;
+
+  /* Kill the proactor thread */
+  if (event_thread_running != 0) {
+      INFO("amqp1 plugin: Stopping proactor thread.");
+      pthread_kill(event_thread_id, SIGTERM);
+      pthread_join(event_thread_id, NULL /* no return value */);
+      memset(&event_thread_id, 0, sizeof(event_thread_id));
+      event_thread_running = 0;
+  }
+
+  /* Free the remaining out_messages */
+  cdm = DEQ_HEAD(out_messages);
+  while (cdm) {
+    DEQ_REMOVE_HEAD(out_messages);
+    cd_message_free(cdm);
+    cdm = DEQ_HEAD(out_messages);
+  }
+
+  pn_proactor_free(proactor);
+
+  plugin_unregister_complex_config("amqp1");
+  plugin_unregister_init("amqp1");
+  /* for each instance */
+  /* plugin_unregister_write("tpname"); */
+  plugin_unregister_shutdown("amqp1");
+
+  /* TODO: free the configuration? */
+
   return 0;
 } /* }}} int amqp1_shutdown */
 
-void module_register(void) {
+void module_register(void)
+{
   plugin_register_complex_config("amqp1", amqp1_config);
   plugin_register_init("amqp1", amqp1_init);
-  /* TODO: amqp1_flush to empty old out_messages */
   plugin_register_shutdown("amqp1",amqp1_shutdown);
-}
+} /* void module_register */
