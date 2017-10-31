@@ -445,8 +445,8 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
   } else {
     char tpname[128];
     snprintf(tpname, sizeof(tpname), "amqp1/%s", instance->name);
-    snprintf(instance->send_to, sizeof(instance->send_to), "u/%s/%s",
-             transport->address, instance->name);
+    snprintf(instance->send_to, sizeof(instance->send_to), "/%s/%s",
+             transport->address,instance->name);
     /* TODO: should this move to after thread is created in init? */
     status = plugin_register_write(tpname, amqp1_write, &(user_data_t) {
             .data = instance, .free_func = amqp1_config_instance_free, });
@@ -553,7 +553,8 @@ static int amqp1_shutdown(void) /* {{{ */
   /* Kill the proactor thread */
   if (event_thread_running != 0) {
       INFO("amqp1 plugin: Stopping proactor thread.");
-      pthread_kill(event_thread_id, SIGTERM);
+      finished=true;
+      /*      pthread_kill(event_thread_id, SIGTERM); */
       pthread_join(event_thread_id, NULL /* no return value */);
       memset(&event_thread_id, 0, sizeof(event_thread_id));
       event_thread_running = 0;
