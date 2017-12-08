@@ -40,6 +40,7 @@
 #include <proton/link.h>
 #include <proton/message.h>
 #include <proton/proactor.h>
+#include <proton/sasl.h>
 #include <proton/session.h>
 #include <proton/transport.h>
 
@@ -53,15 +54,15 @@
 #define AMQP1_FORMAT_COMMAND 1
 #define AMQP1_FORMAT_GRAPHITE 2
 
-typedef struct amqp1_config_t {
-  DEQ_LINKS(struct amqp1_config_t);
+typedef struct amqp1_config_transport_t {
+  DEQ_LINKS(struct amqp1_config_transport_t);
   char              *name;
   char              *host;
   char              *port;
   char              *user;
   char              *password;
   char              *address;
-} amqp1_config_t;
+} amqp1_config_transport_t;
 
 typedef struct amqp1_config_instance_t {
   DEQ_LINKS(struct amqp1_config_instance_t);
@@ -79,29 +80,27 @@ typedef struct amqp1_config_instance_t {
 DEQ_DECLARE(amqp1_config_instance_t, amqp1_config_instance_list_t);
 
 typedef struct cd_message_t {
-    DEQ_LINKS(struct cd_message_t);
-    pn_bytes_t mbuf;
-    amqp1_config_instance_t *instance;
+  DEQ_LINKS(struct cd_message_t);
+  pn_bytes_t mbuf;
+  amqp1_config_instance_t *instance;
 } cd_message_t;
 
 DEQ_DECLARE(cd_message_t, cd_message_list_t);
 
 /* 
- * Global Variables
+ * Globals
  */
-pn_connection_t   *conn;
-pn_session_t      *ssn;
-pn_link_t         *sender;
-pn_proactor_t     *proactor = NULL;
-pthread_mutex_t   send_lock;
-cd_message_list_t out_messages;
-uint64_t          cd_tag = 1;
-int               exit_code = 0;
-uint64_t          acknowledged = 0;
-amqp1_config_t    *transport;
-bool              finished = false;
+pn_connection_t          *conn = NULL;
+pn_session_t             *ssn = NULL;
+pn_link_t                *sender = NULL;
+pn_proactor_t            *proactor = NULL;
+pthread_mutex_t          send_lock;
+cd_message_list_t        out_messages;
+uint64_t                 cd_tag = 1;
+uint64_t                 acknowledged = 0;
+amqp1_config_transport_t *transport = NULL;
+bool                     finished = false;
 
-/* The eventloop thread will run as long as event_loop is set to zero */
 static int       event_thread_running = 0;
 static pthread_t event_thread_id;
 
@@ -166,12 +165,16 @@ static int amqp1_send_out_messages(pn_link_t *link) /* {{{ */
 static void check_condition(pn_event_t *e, pn_condition_t *cond) /* {{{ */
 {
   if (pn_condition_is_set(cond)) {
-    exit_code = 1;
-    /* TODO: log condition name and description */
+    ERROR("amqp1 plugin: %s: %s: %s",
+          pn_event_type_name(pn_event_type(e)),
+          pn_condition_get_name(cond),
+          pn_condition_get_description(cond));
+    pn_connection_close(pn_event_connection(e));
+    conn = NULL;
   }
 } /* }}} void check_condition */
 
-static void handle(pn_event_t *event) /* {{{ */
+static bool handle(pn_event_t *event) /* {{{ */
 {
 
   switch (pn_event_type(event)) {
@@ -200,13 +203,13 @@ static void handle(pn_event_t *event) /* {{{ */
     if (pn_delivery_remote_state(dlv) == PN_ACCEPTED) {
       acknowledged++;
     }
-    /* TODO: treatment for unexpected delivery state */
     break;
   }
 
   case PN_CONNECTION_WAKE: {
-      /* plugin write, wakes sender */
-    amqp1_send_out_messages(sender);
+    if (!finished) {
+      amqp1_send_out_messages(sender);
+    }
     break;
   }
        
@@ -235,23 +238,29 @@ static void handle(pn_event_t *event) /* {{{ */
   }    
 
   case PN_PROACTOR_INACTIVE: {
-    finished = true;
+    return false;
   }
 
-    default: break;
+  default: break;
   }
-} /* }}} void handle */
+  return true;
+} /* }}} bool handle */
 
 static void *event_thread(void __attribute__((unused)) * arg) /* {{{ */
 {
+
   do {
     pn_event_batch_t *events = pn_proactor_wait(proactor);
     pn_event_t *e;
-    while ((e = pn_event_batch_next(events))){
-      handle(e);
+    for (e = pn_event_batch_next(events); e; e = pn_event_batch_next(events)) {
+      if (!handle(e)) {
+        finished = true;
+      }
     }
     pn_proactor_done(proactor, events);
   } while (!finished);
+
+  event_thread_running = 0;
 
   return NULL;
 } /* }}} void event_thread */
@@ -267,7 +276,7 @@ static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
   size_t       bufsize = BUFSIZE;
   pn_data_t    *body;
   pn_message_t *message;
- 
+
   if ((ds == NULL) || (vl == NULL) || (transport == NULL))
     return EINVAL;
 
@@ -309,7 +318,6 @@ static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
 
   /* encode message */
   message = pn_message();
-  /* todo: proper address generation concat conf->address, instance->name */
   pn_message_set_address(message, instance->send_to);
   body = pn_message_body(message);
   pn_data_clear(body);
@@ -327,14 +335,16 @@ static int amqp1_write(const data_set_t *ds, const value_list_t *vl, /* {{{ */
   pn_message_free(message);
 
   /* activate the sender */
-  pn_connection_wake(conn);
+  if (conn != NULL) {
+    pn_connection_wake(conn);
+  }
 
   return 0;
 } /* }}} int amqp_write1 */
 
 static void amqp1_config_transport_free(void *ptr) /* {{{ */
 {
-  amqp1_config_t *transport = ptr;
+  amqp1_config_transport_t *transport = ptr;
  
   if (transport == NULL)
     return;
@@ -368,7 +378,6 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
   char *key = NULL;
   amqp1_config_instance_t *instance;
 
-  /* TODO: fix conf and instance references */
   instance = calloc(1, sizeof(*instance));
   if (instance == NULL) {
     ERROR("amqp1 plugin: calloc failed.");
@@ -432,9 +441,9 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
       sfree(tmp_buff);
     }
     else
-        WARNING("amqp1 plugin: Ignoring unknown "
-                "instance configuration option "
-                "\%s\".", child->key);
+      WARNING("amqp1 plugin: Ignoring unknown "
+              "instance configuration option "
+              "\%s\".", child->key);
     if (status != 0)
       break;
   }
@@ -447,13 +456,13 @@ static int amqp1_config_instance(oconfig_item_t *ci) /* {{{ */
     snprintf(tpname, sizeof(tpname), "amqp1/%s", instance->name);
     snprintf(instance->send_to, sizeof(instance->send_to), "/%s/%s",
              transport->address,instance->name);
-    /* TODO: should this move to after thread is created in init? */
     status = plugin_register_write(tpname, amqp1_write, &(user_data_t) {
             .data = instance, .free_func = amqp1_config_instance_free, });
     if (status != 0) {
       amqp1_config_instance_free(instance);
     }
   }
+
   return status;
 } /* }}} int amqp1_config_instance */
   
@@ -492,9 +501,9 @@ static int amqp1_config_transport(oconfig_item_t *ci) /* {{{ */
     else if (strcasecmp("Instance",child->key) == 0)
       amqp1_config_instance(child);
     else
-        WARNING("amqp1 plugin: Ignoring unknown "
-                "transport configuration option "
-                "\%s\".", child->key);
+      WARNING("amqp1 plugin: Ignoring unknown "
+              "transport configuration option "
+              "\%s\".", child->key);
    
     if (status != 0)
       break;
@@ -508,14 +517,15 @@ static int amqp1_config_transport(oconfig_item_t *ci) /* {{{ */
 
 static int amqp1_config(oconfig_item_t *ci) /* {{{ */
 {
+
   for (int i = 0; i < ci->children_num; i++) {
     oconfig_item_t *child = ci->children + i;
 
     if (strcasecmp("Transport", child->key) == 0)
-        amqp1_config_transport(child);
+      amqp1_config_transport(child);
     else
-        WARNING("amqp1 plugin: Ignoring unknown config iption \%s\".",
-                child->key);
+      WARNING("amqp1 plugin: Ignoring unknown config iption \%s\".",
+              child->key);
   }
 
   return 0;
@@ -527,10 +537,20 @@ static int amqp1_init(void) /* {{{ */
   int  status;
   char errbuf[1024];
 
+  if (transport == NULL) {
+    ERROR("amqp1: init failed, no transport configured");
+    return -1;
+  }
+
   if (proactor == NULL) {
     pthread_mutex_init(&send_lock, /* attr = */ NULL);
     proactor = pn_proactor();
     pn_proactor_addr(addr, sizeof(addr),transport->host,transport->port);
+    conn = pn_connection();
+    if (transport->user != NULL) {
+        pn_connection_set_user(conn, transport->user);
+        pn_connection_set_password(conn, transport->password);
+    }
     pn_proactor_connect(proactor, conn, addr);
     /* start_thread */
     status = plugin_thread_create(&event_thread_id, NULL /* no attributes */,
@@ -546,18 +566,18 @@ static int amqp1_init(void) /* {{{ */
   return 0;
 } /* }}} int amqp1_init */
 
-static int amqp1_shutdown(void) /* {{{ */
+static int amqp1_shutdown
+(void) /* {{{ */
 {
   cd_message_t *cdm;
 
-  /* Kill the proactor thread */
+  /* Stop the proactor thread */
   if (event_thread_running != 0) {
-      INFO("amqp1 plugin: Stopping proactor thread.");
-      finished=true;
-      /*      pthread_kill(event_thread_id, SIGTERM); */
-      pthread_join(event_thread_id, NULL /* no return value */);
-      memset(&event_thread_id, 0, sizeof(event_thread_id));
-      event_thread_running = 0;
+    finished=true;
+    /* activate the event thread */
+    pn_connection_wake(conn);
+    pthread_join(event_thread_id, NULL /* no return value */);
+    memset(&event_thread_id, 0, sizeof(event_thread_id));
   }
 
   /* Free the remaining out_messages */
@@ -568,15 +588,13 @@ static int amqp1_shutdown(void) /* {{{ */
     cdm = DEQ_HEAD(out_messages);
   }
 
-  pn_proactor_free(proactor);
+  if (proactor != NULL) {
+    pn_proactor_free(proactor);
+  }
 
-  plugin_unregister_complex_config("amqp1");
-  plugin_unregister_init("amqp1");
-  /* for each instance */
-  /* plugin_unregister_write("tpname"); */
-  plugin_unregister_shutdown("amqp1");
-
-  /* TODO: free the configuration? */
+  if (transport != NULL) {
+    amqp1_config_transport_free(transport);
+  }
 
   return 0;
 } /* }}} int amqp1_shutdown */
