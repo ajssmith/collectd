@@ -740,7 +740,7 @@ is preserved, i.e. passed through.
 
 =head2 Plugin C<amqp1>
 
-The I<AMQP plugin> can be used to communicate with other instances of
+The I<AMQP1 plugin> can be used to communicate with other instances of
 I<collectd> or third party applications using an AMQP 1.0 message
 intermediary. Values are sent to the messaging intermediary which
 may handle direct messaging or queue based transfer.
@@ -829,11 +829,12 @@ determine how to decode the values.
 
 =item B<PreSettle> B<true>|B<false>
 
-If set to B<false> (the default), the plugin will wait from a message
+If set to B<false> (the default), the plugin will wait for a message
 acknowledgement from the messaging bus before sending the next
 message. This indicates transfer of ownership to the messaging
-system. If set to B<true>, the message may be lost if messaging system
-does not have sufficient resources to transfer ownership of the message.
+system. If set to B<true>, the plugin will not wait for a message
+acknowledgement and the message may be dropped prior to transfer of
+ownership.
 
 =item B<StoreRates> B<true>|B<false>
 
